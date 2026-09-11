@@ -64,7 +64,6 @@
 #include "sick_scan/sick_scan_services.h"
 #include "sick_scan/sick_scan_messages.h"
 #include "sick_scan/sick_generic_callback.h"
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <string>
@@ -73,6 +72,9 @@
 
 namespace
 {
+    // Seconds to wait before reconnecting after LIDoutputstate activation failed.
+    constexpr int LIDOUTPUTSTATE_RETRY_DELAY_SEC = 5;
+
     /*
      * Returns the 3 character sopas command id of a raw datagram, e.g. "sSN" for an event telegram,
      * "sRA" for a read reply, "sEA" for an event-subscription acknowledge or "sFA" for an error reply.
@@ -447,8 +449,13 @@ bool sick_scansegment_xd::MsgPackThreads::runThreadCb(void)
         }
         if (m_config.activate_lidoutputstate && !lidoutputstate_activation_failed && sopas_tcp && sopas_service && sopas_tcp->isConnected())
         {
-            // Dedicated worker thread: the only consumer of LIDoutputstate datagrams, so a non-blocking
-            // tryPop is safe and no other thread can steal a datagram between the wait and the pop.
+            // Dedicated worker thread. tryPop rather than pop: recvQueue has other consumers
+            // (sendSopasAndCheckAnswer from the ros service callbacks), and findFirstByKeyword
+            // additionally matches *any* sFA error reply regardless of keyword, so an entry can be
+            // taken between the wait and the pop - a blocking pop would then wedge this thread,
+            // ignoring run_lidoutputstate_thread. For the same reason this thread may consume an
+            // error reply meant for another request; harmless as long as no sopas service is
+            // called while it runs.
             run_lidoutputstate_thread = true;
             lidoutputstate_thread = std::thread([this, sopas_tcp, &lidoutputstate_publisher, &run_lidoutputstate_thread]()
             {
@@ -616,6 +623,17 @@ bool sick_scansegment_xd::MsgPackThreads::runThreadCb(void)
         catch(const std::exception& e)
         {
             std::cerr << "## ERROR sick_scansegment_xd exit: exception \"" << e.what() << "\"" << std::endl;
+        }
+
+        if (lidoutputstate_activation_failed)
+        {
+            // Activation failure is usually persistent (insufficient user level, firmware without
+            // LIDoutputstate support), and every retry costs a full tcp connect plus authorization.
+            // Back off so a device that can never succeed is not hammered with sopas sessions.
+            for (int n = 0; n < LIDOUTPUTSTATE_RETRY_DELAY_SEC && m_run_scansegment_thread && rosOk(); n++)
+            {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
         }
     }
 
